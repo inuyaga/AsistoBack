@@ -110,12 +110,19 @@ def _deduplicate_rapid_logs(
     logs: list[AttendanceLog],
     min_gap_seconds: int = 60,
 ) -> list[AttendanceLog]:
-    """Filter out accidental duplicate scans within `min_gap_seconds`."""
+    """Filter out accidental duplicate scans within `min_gap_seconds` while preserving explicit mobile transitions."""
     if len(logs) <= 1:
         return list(logs)
     filtered: list[AttendanceLog] = [logs[0]]
     for current in logs[1:]:
         prev = filtered[-1]
+        if (
+            current.source_type == "mobile_device"
+            and current.attendance_status
+            and current.attendance_status != prev.attendance_status
+        ):
+            filtered.append(current)
+            continue
         gap = abs((_ensure_utc(current.event_time) - _ensure_utc(prev.event_time)).total_seconds())
         if gap < min_gap_seconds:
             continue
@@ -204,23 +211,56 @@ def _classify_logs_by_shift(
     Optional[AttendanceLog],
     Optional[AttendanceLog],
 ]:
-    """Determine Entrada, Salida a Comida, Regreso de Comida, and Salida strictly from the collaborator's Shift schedule and log times."""
+    """Determine Entrada, Salida a Comida, Regreso de Comida, and Salida from explicit mobile logs and/or Shift schedule."""
     if not effective_logs:
         return None, None, None, None
 
-    check_in_log: AttendanceLog = effective_logs[0]
+    check_in_log: Optional[AttendanceLog] = None
     meal_out_log: Optional[AttendanceLog] = None
     meal_in_log: Optional[AttendanceLog] = None
     check_out_log: Optional[AttendanceLog] = None
 
-    rest_logs = effective_logs[1:]
+    # 1. Asignar primero cualquier marca explícita originada desde la app móvil ('mobile_device')
+    unassigned_logs: list[AttendanceLog] = []
+    for lg in effective_logs:
+        if lg.source_type == "mobile_device" and lg.attendance_status in (
+            "checkIn",
+            "breakOut",
+            "breakIn",
+            "checkOut",
+        ):
+            if lg.attendance_status == "checkIn" and check_in_log is None:
+                check_in_log = lg
+            elif lg.attendance_status == "breakOut" and meal_out_log is None:
+                meal_out_log = lg
+            elif lg.attendance_status == "breakIn" and meal_in_log is None:
+                meal_in_log = lg
+            elif lg.attendance_status == "checkOut":
+                check_out_log = lg
+            else:
+                unassigned_logs.append(lg)
+        else:
+            unassigned_logs.append(lg)
+
+    # 2. Si aún faltan marcas y existen checadas de reloj biométrico ('clock_device'), clasificarlas por horario de turno
+    if check_in_log is None and unassigned_logs:
+        check_in_log = unassigned_logs[0]
+        rest_logs = unassigned_logs[1:]
+    else:
+        rest_logs = unassigned_logs
+
+    if check_in_log is None:
+        check_in_log = effective_logs[0]
+        rest_logs = [lg for lg in effective_logs[1:] if lg not in (meal_out_log, meal_in_log, check_out_log)]
+
     if rest_logs:
         if eff_shift is None or not eff_shift.has_meal_break:
-            candidate_last = rest_logs[-1]
-            if (
-                _ensure_utc(candidate_last.event_time) - _ensure_utc(check_in_log.event_time)
-            ).total_seconds() >= 60:
-                check_out_log = candidate_last
+            if check_out_log is None:
+                candidate_last = rest_logs[-1]
+                if (
+                    _ensure_utc(candidate_last.event_time) - _ensure_utc(check_in_log.event_time)
+                ).total_seconds() >= 60:
+                    check_out_log = candidate_last
         else:
             sched_in_time = _parse_hhmm_to_time(eff_shift.check_in_time, time(9, 0))
             sched_out_time = _parse_hhmm_to_time(eff_shift.check_out_time, time(18, 0))
@@ -253,21 +293,25 @@ def _classify_logs_by_shift(
 
             if len(rest_logs) == 1:
                 second_local_dt = _ensure_utc(rest_logs[0].event_time).astimezone(tz)
-                if second_local_dt < meal_to_checkout_cutoff_dt:
+                if second_local_dt < meal_to_checkout_cutoff_dt and meal_out_log is None:
                     meal_out_log = rest_logs[0]
-                else:
+                elif check_out_log is None:
                     check_out_log = rest_logs[0]
             elif len(rest_logs) == 2:
-                meal_out_log = rest_logs[0]
+                if meal_out_log is None:
+                    meal_out_log = rest_logs[0]
                 third_local_dt = _ensure_utc(rest_logs[1].event_time).astimezone(tz)
-                if third_local_dt < meal_to_checkout_cutoff_dt:
+                if third_local_dt < meal_to_checkout_cutoff_dt and meal_in_log is None:
                     meal_in_log = rest_logs[1]
-                else:
+                elif check_out_log is None:
                     check_out_log = rest_logs[1]
             else:
-                meal_out_log = rest_logs[0]
-                meal_in_log = rest_logs[1]
-                check_out_log = rest_logs[-1]
+                if meal_out_log is None:
+                    meal_out_log = rest_logs[0]
+                if meal_in_log is None:
+                    meal_in_log = rest_logs[1]
+                if check_out_log is None:
+                    check_out_log = rest_logs[-1]
 
     # Actualizar el tipo de checada (attendance_status) calculado por el turno en cada log
     check_in_log.attendance_status = "checkIn"
@@ -948,6 +992,14 @@ def sync_collaborator_daily_attendance(
         db.add(existing)
 
     _apply_calculated_item_to_record(existing, item, eval_date, frozen_snapshot)
+    if existing.branch_id is None and collab.branch_id is not None:
+        existing.branch_id = collab.branch_id
+        existing.branch_name = collab.branch_name
+    for lg in day_logs:
+        if lg.branch_id is not None:
+            existing.branch_id = lg.branch_id
+        if lg.comments:
+            existing.check_out_comments = lg.comments
     db.commit()
     db.refresh(existing)
     return existing

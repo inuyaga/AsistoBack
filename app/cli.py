@@ -21,10 +21,12 @@ from sqlalchemy.orm import Session  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.core.database import Base, SessionLocal, engine  # noqa: E402
 from app.core.security import get_password_hash  # noqa: E402
+from app.core.storage import extract_jpeg_bytes_from_base64, store_collaborator_face_image  # noqa: E402
 import app.models  # noqa: E402, F401 - ensure all ORM models are registered
 from app.models.attendance import Shift  # noqa: E402
-from app.models.collaborator import Company  # noqa: E402
+from app.models.collaborator import Collaborator, Company  # noqa: E402
 from app.models.device import HikvisionDevice, ISAPINotificationConfig  # noqa: E402
+from app.models.mobile import Branch, Geofence  # noqa: E402
 from app.models.user import Permission, Role, User  # noqa: E402
 
 DEFAULT_PERMISSIONS: list[tuple[str, str, str]] = [
@@ -127,8 +129,164 @@ def ensure_tables_and_defaults(db: Session) -> list[Permission]:
     )
     db.execute(
         text(
+            "ALTER TABLE companies "
+            "ADD COLUMN IF NOT EXISTS timezone VARCHAR(64) NOT NULL DEFAULT 'America/Mexico_City'"
+        )
+    )
+    db.execute(
+        text(
             "ALTER TABLE collaborators "
             "ADD COLUMN IF NOT EXISTS shift_id INTEGER REFERENCES shifts(id) ON DELETE SET NULL"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE collaborators "
+            "ADD COLUMN IF NOT EXISTS branch_id INTEGER REFERENCES branches(id) ON DELETE SET NULL"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE collaborators "
+            "ADD COLUMN IF NOT EXISTS face_media_path VARCHAR(500)"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE collaborators "
+            "ADD COLUMN IF NOT EXISTS face_reference_version VARCHAR(64)"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE collaborators "
+            "ADD COLUMN IF NOT EXISTS face_sha256 VARCHAR(64)"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS client_event_id VARCHAR(64)"
+        )
+    )
+    db.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_attendance_logs_client_event_id "
+            "ON attendance_logs (client_event_id)"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS mobile_device_fk INTEGER REFERENCES mobile_devices(id) ON DELETE SET NULL"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS branch_id INTEGER REFERENCES branches(id) ON DELETE SET NULL"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS captured_at TIMESTAMPTZ"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS accuracy_meters DOUBLE PRECISION"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS geofence_id INTEGER REFERENCES geofences(id) ON DELETE SET NULL"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS geofence_version INTEGER"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS geofence_assignment_id VARCHAR(100)"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS inside_geofence BOOLEAN"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS distance_meters DOUBLE PRECISION"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS identity_method VARCHAR(64)"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS face_reference_version VARCHAR(64)"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS liveness_passed BOOLEAN"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS match_passed BOOLEAN"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS match_score DOUBLE PRECISION"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS comments VARCHAR(500)"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE attendance_logs "
+            "ADD COLUMN IF NOT EXISTS photo_media_path VARCHAR(500)"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE daily_attendances "
+            "ADD COLUMN IF NOT EXISTS branch_id INTEGER REFERENCES branches(id) ON DELETE SET NULL"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE daily_attendances "
+            "ADD COLUMN IF NOT EXISTS branch_name VARCHAR(150)"
+        )
+    )
+    db.execute(
+        text(
+            "ALTER TABLE daily_attendances "
+            "ADD COLUMN IF NOT EXISTS check_out_comments VARCHAR(500)"
         )
     )
     db.execute(
@@ -137,6 +295,33 @@ def ensure_tables_and_defaults(db: Session) -> list[Permission]:
             "ON attendance_logs (collaborator_id, event_time)"
         )
     )
+
+    # Migrar automáticamente cualquier fotografía facial legada en Base64 hacia archivo media (local / S3)
+    legacy_face_collabs = list(
+        db.scalars(
+            select(Collaborator).where(
+                Collaborator.face_image_base64.is_not(None),
+                Collaborator.face_media_path.is_(None),
+            )
+        ).all()
+    )
+    for col in legacy_face_collabs:
+        if col.face_image_base64 and col.face_image_base64.strip():
+            try:
+                jpeg_bytes = extract_jpeg_bytes_from_base64(col.face_image_base64)
+                stored = store_collaborator_face_image(
+                    company_id=col.company_id,
+                    collaborator_id=col.id,
+                    jpeg_bytes=jpeg_bytes,
+                    previous_version=col.face_reference_version,
+                    previous_media_path=col.face_media_path,
+                )
+                col.face_media_path = stored.media_path
+                col.face_reference_version = stored.version
+                col.face_sha256 = stored.sha256
+                col.face_image_base64 = None
+            except Exception:
+                pass
 
     default_company = db.scalar(select(Company).order_by(Company.id.asc()).limit(1))
     if not default_company:
@@ -147,6 +332,44 @@ def ensure_tables_and_defaults(db: Session) -> list[Permission]:
             notes="Empresa inicial creada automáticamente",
         )
         db.add(default_company)
+        db.flush()
+
+    default_branch = db.scalar(
+        select(Branch).where(Branch.company_id == default_company.id).order_by(Branch.id.asc()).limit(1)
+    )
+    if not default_branch:
+        default_branch = Branch(
+            company_id=default_company.id,
+            code="SUC-001",
+            name="Oficina Central",
+            address=default_company.address or "Av. Tecnológico 1000, Villahermosa, Tabasco",
+            timezone=default_company.timezone or "America/Mexico_City",
+            is_active=True,
+        )
+        db.add(default_branch)
+        db.flush()
+
+    default_geofence = db.scalar(
+        select(Geofence)
+        .where(Geofence.company_id == default_company.id)
+        .order_by(Geofence.id.asc())
+        .limit(1)
+    )
+    if not default_geofence:
+        default_geofence = Geofence(
+            company_id=default_company.id,
+            branch_id=default_branch.id,
+            code="GEO-001",
+            name="Geocerca Oficina Central",
+            version=1,
+            geofence_type="radial",
+            center_latitude=17.97884283887797,
+            center_longitude=-92.98384174523528,
+            radius_meters=150.0,
+            max_accuracy_meters=50.0,
+            is_active=True,
+        )
+        db.add(default_geofence)
         db.flush()
 
     default_shift = db.scalar(select(Shift).order_by(Shift.id.asc()).limit(1))

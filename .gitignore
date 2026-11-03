@@ -64,6 +64,9 @@ logs/
 *.sqlite3
 *.db
 
+# Local media storage folder
+media/
+
 # IDEs & Editors
 .vscode/
 .idea/

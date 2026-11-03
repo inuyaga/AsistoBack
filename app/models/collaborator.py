@@ -9,6 +9,7 @@ from app.core.database import Base
 if TYPE_CHECKING:
     from app.models.attendance import Shift
     from app.models.device import HikvisionDevice
+    from app.models.mobile import Branch, GeofenceAssignment, MobileDevice
 
 
 class Company(Base):
@@ -23,6 +24,7 @@ class Company(Base):
     name: Mapped[str] = mapped_column(String(150), unique=True, index=True, nullable=False)
     tax_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    timezone: Mapped[str] = mapped_column(String(64), default="America/Mexico_City", nullable=False)
     contact_name: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     contact_email: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
     contact_phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
@@ -44,13 +46,13 @@ class Company(Base):
     devices: Mapped[list["HikvisionDevice"]] = relationship(
         "HikvisionDevice",
         back_populates="company",
-        lazy="selectin",
+        lazy="select",
     )
     collaborators: Mapped[list["Collaborator"]] = relationship(
         "Collaborator",
         back_populates="company",
         cascade="all, delete-orphan",
-        lazy="selectin",
+        lazy="select",
     )
 
     @property
@@ -83,6 +85,12 @@ class Collaborator(Base):
         index=True,
         nullable=True,
     )
+    branch_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("branches.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
     employee_no: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     first_name: Mapped[str] = mapped_column(String(100), nullable=False)
     last_name: Mapped[str] = mapped_column(String(120), nullable=False)
@@ -94,10 +102,14 @@ class Collaborator(Base):
     position: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     card_no: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
-    # Parámetros ISAPI para el reloj Hikvision
+    # Parámetros ISAPI para el reloj Hikvision y referencia de almacenamiento media (local / S3)
     user_type: Mapped[str] = mapped_column(String(24), default="normal", nullable=False)
     valid_begin_time: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     valid_end_time: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    face_media_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    face_reference_version: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    face_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # Columna legada: se migra automáticamente a archivo en media_path y queda en NULL en BD
     face_image_base64: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -126,12 +138,32 @@ class Collaborator(Base):
         back_populates="collaborators",
         lazy="selectin",
     )
+    branch: Mapped[Optional["Branch"]] = relationship(
+        "Branch",
+        lazy="selectin",
+    )
     device_syncs: Mapped[list["CollaboratorDeviceSync"]] = relationship(
         "CollaboratorDeviceSync",
         back_populates="collaborator",
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+    geofence_assignments: Mapped[list["GeofenceAssignment"]] = relationship(
+        "GeofenceAssignment",
+        back_populates="collaborator",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    mobile_devices: Mapped[list["MobileDevice"]] = relationship(
+        "MobileDevice",
+        back_populates="collaborator",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+    @property
+    def public_id(self) -> str:
+        return f"emp_{self.id:05d}"
 
     @property
     def full_name(self) -> str:
@@ -154,8 +186,76 @@ class Collaborator(Base):
         return self.shift.code if self.shift else None
 
     @property
+    def branch_name(self) -> Optional[str]:
+        return self.branch.name if self.branch else None
+
+    @property
+    def _active_geofence_assignment(self) -> Optional["GeofenceAssignment"]:
+        active_list = [
+            a
+            for a in self.geofence_assignments
+            if a.is_active and a.geofence and a.geofence.is_active
+        ]
+        if not active_list:
+            return None
+        active_list.sort(key=lambda a: (a.priority, -a.id))
+        return active_list[0]
+
+    @property
+    def primary_geofence_id(self) -> Optional[int]:
+        assign = self._active_geofence_assignment
+        if assign and assign.geofence:
+            return assign.geofence.id
+        if self.branch and self.branch.geofences:
+            active_branch_geos = [g for g in self.branch.geofences if g.is_active]
+            if active_branch_geos:
+                return active_branch_geos[0].id
+        return None
+
+    @property
+    def primary_geofence_name(self) -> Optional[str]:
+        assign = self._active_geofence_assignment
+        if assign and assign.geofence:
+            return assign.geofence.name
+        if self.branch and self.branch.geofences:
+            active_branch_geos = [g for g in self.branch.geofences if g.is_active]
+            if active_branch_geos:
+                return active_branch_geos[0].name
+        return None
+
+    @property
+    def primary_geofence_type(self) -> Optional[str]:
+        assign = self._active_geofence_assignment
+        if assign and assign.geofence:
+            return assign.geofence.geofence_type
+        if self.branch and self.branch.geofences:
+            active_branch_geos = [g for g in self.branch.geofences if g.is_active]
+            if active_branch_geos:
+                return active_branch_geos[0].geofence_type
+        return None
+
+    @property
+    def geofence_assignments_count(self) -> int:
+        return sum(1 for a in self.geofence_assignments if a.is_active)
+
+    @property
+    def has_active_mobile_device(self) -> bool:
+        return any(d.status == "active" for d in self.mobile_devices)
+
+    @property
+    def mobile_device_model(self) -> Optional[str]:
+        for d in sorted(self.mobile_devices, key=lambda x: x.id, reverse=True):
+            if d.status == "active":
+                label = f"{d.manufacturer or ''} {d.model or ''}".strip()
+                return label or d.platform or "Móvil Activo"
+        return None
+
+    @property
     def has_face_image(self) -> bool:
-        return bool(self.face_image_base64 and self.face_image_base64.strip())
+        return bool(
+            (self.face_media_path and self.face_media_path.strip())
+            or (self.face_image_base64 and self.face_image_base64.strip())
+        )
 
 
 class CollaboratorDeviceSync(Base):

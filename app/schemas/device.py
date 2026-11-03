@@ -347,9 +347,26 @@ class AttendanceLogRead(BaseModel):
     door_no: Optional[int] = None
     serial_no: Optional[int] = None
     is_valid_attendance: bool = True
+    client_event_id: Optional[str] = None
     mobile_device_id: Optional[str] = None
+    mobile_device_fk: Optional[int] = None
+    branch_id: Optional[int] = None
+    captured_at: Optional[datetime] = None
     latitude: Optional[str] = None
     longitude: Optional[str] = None
+    accuracy_meters: Optional[float] = None
+    geofence_id: Optional[int] = None
+    geofence_version: Optional[int] = None
+    geofence_assignment_id: Optional[str] = None
+    inside_geofence: Optional[bool] = None
+    distance_meters: Optional[float] = None
+    identity_method: Optional[str] = None
+    face_reference_version: Optional[str] = None
+    liveness_passed: Optional[bool] = None
+    match_passed: Optional[bool] = None
+    match_score: Optional[float] = None
+    comments: Optional[str] = None
+    photo_media_path: Optional[str] = None
     raw_payload: Optional[str] = None
     event_time: datetime
     created_at: datetime

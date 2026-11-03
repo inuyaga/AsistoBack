@@ -21,6 +21,7 @@ from app.core.database import Base
 if TYPE_CHECKING:
     from app.models.collaborator import Collaborator, CollaboratorDeviceSync, Company
     from app.models.device import HikvisionDevice
+    from app.models.mobile import Branch, Geofence, MobileDevice
 
 
 class Shift(Base):
@@ -174,10 +175,51 @@ class AttendanceLog(Base):
     serial_no: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     is_valid_attendance: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
-    # Campos preparados para futuras checadas desde dispositivo móvil
+    # Campos para checadas desde dispositivo móvil (Asisto) y auditoría de geocerca/identidad
+    client_event_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        unique=True,
+        index=True,
+        nullable=True,
+    )
     mobile_device_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    mobile_device_fk: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("mobile_devices.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+    branch_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("branches.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+    captured_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     latitude: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     longitude: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    accuracy_meters: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    geofence_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("geofences.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+    geofence_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    geofence_assignment_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    inside_geofence: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    distance_meters: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    identity_method: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    face_reference_version: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    liveness_passed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    match_passed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    match_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    comments: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    # Referencia de path media relativo (local / S3) si el evento adjunta foto de evidencia
+    photo_media_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     raw_payload: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -253,11 +295,19 @@ class DailyAttendance(Base):
     attendance_date: Mapped[date] = mapped_column(Date, index=True, nullable=False)
     weekday: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    # Snapshot del colaborador en la fecha evaluada
+    # Snapshot del colaborador y sucursal en la fecha evaluada
     employee_no: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     collaborator_name: Mapped[str] = mapped_column(String(220), nullable=False)
     department: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
     position: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    branch_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        ForeignKey("branches.id", ondelete="SET NULL"),
+        index=True,
+        nullable=True,
+    )
+    branch_name: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    check_out_comments: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     # Snapshot INMUTABLE del turno vigente en esa fecha (no cambia si después se edita el turno o se reasigna otro)
     shift_id: Mapped[Optional[int]] = mapped_column(

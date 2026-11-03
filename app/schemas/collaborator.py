@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.core.storage import read_media_as_data_url
 
 
 class CompanyBase(BaseModel):
@@ -76,6 +78,10 @@ class CollaboratorBase(BaseModel):
         default=None,
         description="ID del turno laboral asignado al colaborador para el cálculo de asistencias",
     )
+    branch_id: Optional[int] = Field(
+        default=None,
+        description="ID de la sucursal asignada al colaborador",
+    )
     employee_no: str = Field(..., min_length=1, max_length=64, examples=["1001"])
     first_name: str = Field(..., min_length=1, max_length=100, examples=["Juan"])
     last_name: str = Field(..., min_length=1, max_length=120, examples=["Pérez López"])
@@ -112,6 +118,10 @@ class CollaboratorBase(BaseModel):
 
 
 class CollaboratorCreate(CollaboratorBase):
+    geofence_id: Optional[int] = Field(
+        default=None,
+        description="ID opcional de la geocerca principal a asignar directamente al colaborador",
+    )
     face_image_base64: Optional[str] = Field(
         default=None,
         description="Fotografía facial en formato JPEG base64 (opcional)",
@@ -127,6 +137,14 @@ class CollaboratorUpdate(BaseModel):
     shift_id: Optional[int] = Field(
         default=None,
         description="ID del turno laboral a asignar (enviar 0 o null explícito para desasignar)",
+    )
+    branch_id: Optional[int] = Field(
+        default=None,
+        description="ID de la sucursal a asignar (enviar 0 o null explícito para desasignar)",
+    )
+    geofence_id: Optional[int] = Field(
+        default=None,
+        description="ID de la geocerca principal a asignar (enviar 0 o null explícito para desasignar)",
     )
     employee_no: Optional[str] = Field(default=None, min_length=1, max_length=64)
     first_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
@@ -156,12 +174,28 @@ class CollaboratorRead(CollaboratorBase):
     company_code: str
     shift_name: Optional[str] = None
     shift_code: Optional[str] = None
+    branch_name: Optional[str] = None
+    primary_geofence_id: Optional[int] = None
+    primary_geofence_name: Optional[str] = None
+    primary_geofence_type: Optional[str] = None
+    geofence_assignments_count: int = 0
+    has_active_mobile_device: bool = False
+    mobile_device_model: Optional[str] = None
     has_face_image: bool
+    face_media_path: Optional[str] = None
+    face_reference_version: Optional[str] = None
+    face_sha256: Optional[str] = None
     face_image_base64: Optional[str] = None
     last_synced_at: Optional[datetime] = None
     device_syncs: list[CollaboratorDeviceSyncRead] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def populate_face_preview_from_storage(self) -> "CollaboratorRead":
+        if self.face_media_path and not self.face_image_base64:
+            self.face_image_base64 = read_media_as_data_url(self.face_media_path)
+        return self
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.middleware.trustedhost import TrustedHostMiddleware  # noqa: E402
 
 from app.api import api_router  # noqa: E402
+from app.api.routes.mobile import MobileAPIError, mobile_api_error_handler, router as mobile_router  # noqa: E402
 from app.cli import ensure_tables_and_defaults  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.core.database import SessionLocal  # noqa: E402
@@ -59,7 +60,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.add_exception_handler(MobileAPIError, mobile_api_error_handler)  # type: ignore[arg-type]
+
 app.include_router(api_router, prefix=settings.API_V1_STR)
+if settings.API_V1_STR != "/v1":
+    app.include_router(mobile_router, prefix="/v1", include_in_schema=False)
 
 
 @app.get("/", tags=["root"])

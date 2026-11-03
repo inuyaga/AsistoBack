@@ -9,9 +9,16 @@ from sqlalchemy.orm import Session
 from app.api.deps import CurrentUser, SessionDep
 from app.api.routes.devices import _build_isapi_client
 from app.core.isapi import ISAPIError
+from app.core.storage import (
+    extract_jpeg_bytes_from_base64,
+    get_media_storage,
+    read_media_as_data_url,
+    store_collaborator_face_image,
+)
 from app.models.attendance import Shift
 from app.models.collaborator import Collaborator, CollaboratorDeviceSync, Company
 from app.models.device import HikvisionDevice
+from app.models.mobile import Branch, Geofence, GeofenceAssignment
 from app.models.user import User
 from app.schemas.collaborator import (
     CollaboratorBulkSyncDevicesRequest,
@@ -300,12 +307,17 @@ def _execute_collaborators_device_sync(
                     face_ok = False
                     face_warn: Optional[str] = None
 
-                    if include_face and collab.has_face_image and collab.face_image_base64:
-                        try:
-                            client.save_face_image(collab.face_image_base64, sync_emp_no)
-                            face_ok = True
-                        except ISAPIError as face_exc:
-                            face_warn = face_exc.message
+                    if include_face and collab.has_face_image:
+                        face_data_url = (
+                            read_media_as_data_url(collab.face_media_path)
+                            or collab.face_image_base64
+                        )
+                        if face_data_url:
+                            try:
+                                client.save_face_image(face_data_url, sync_emp_no)
+                                face_ok = True
+                            except ISAPIError as face_exc:
+                                face_warn = face_exc.message
 
                     device.status = "online"
                     device.last_seen_at = now
@@ -575,12 +587,14 @@ def delete_company(db: SessionDep, company_id: int) -> None:
     "/collaborators",
     response_model=list[CollaboratorRead],
     dependencies=[Depends(require_any_permission("collaborators:read", "devices:isapi", "attendance:read", "shifts:read"))],
-    summary="Listar colaboradores (filtrable por empresa, turno, búsqueda y estado)",
+    summary="Listar colaboradores (filtrable por empresa, turno, sucursal, geocerca, búsqueda y estado)",
 )
 def list_collaborators(
     db: SessionDep,
     company_id: Optional[int] = Query(default=None, description="Filtrar colaboradores por empresa"),
     shift_id: Optional[int] = Query(default=None, description="Filtrar colaboradores por turno asignado"),
+    branch_id: Optional[int] = Query(default=None, description="Filtrar colaboradores por sucursal"),
+    geofence_id: Optional[int] = Query(default=None, description="Filtrar colaboradores por geocerca asignada"),
     search: Optional[str] = Query(
         default=None,
         description="Filtrar por No. empleado, nombre, apellidos, puesto o departamento",
@@ -596,6 +610,18 @@ def list_collaborators(
             stmt = stmt.where(Collaborator.shift_id.is_(None))
         else:
             stmt = stmt.where(Collaborator.shift_id == shift_id)
+    if branch_id is not None:
+        if branch_id == 0:
+            stmt = stmt.where(Collaborator.branch_id.is_(None))
+        else:
+            stmt = stmt.where(Collaborator.branch_id == branch_id)
+    if geofence_id is not None:
+        assigned_collab_ids = select(GeofenceAssignment.collaborator_id).where(
+            GeofenceAssignment.geofence_id == geofence_id,
+            GeofenceAssignment.is_active.is_(True),
+            GeofenceAssignment.collaborator_id.is_not(None),
+        )
+        stmt = stmt.where(Collaborator.id.in_(assigned_collab_ids))
     if search and search.strip():
         term = f"%{search.strip()}%"
         stmt = stmt.where(
@@ -613,9 +639,17 @@ def list_collaborators(
     if is_active is not None:
         stmt = stmt.where(Collaborator.is_active == is_active)
     if has_face is True:
-        stmt = stmt.where(Collaborator.face_image_base64.is_not(None))
+        stmt = stmt.where(
+            or_(
+                Collaborator.face_media_path.is_not(None),
+                Collaborator.face_image_base64.is_not(None),
+            )
+        )
     elif has_face is False:
-        stmt = stmt.where(Collaborator.face_image_base64.is_(None))
+        stmt = stmt.where(
+            Collaborator.face_media_path.is_(None),
+            Collaborator.face_image_base64.is_(None),
+        )
 
     stmt = stmt.order_by(Collaborator.company_id.asc(), Collaborator.employee_no.asc())
     return list(db.scalars(stmt).all())
@@ -649,7 +683,15 @@ def create_collaborator(
             ),
         )
 
-    normalized_face = _normalize_and_validate_jpeg_base64(payload.face_image_base64)
+    jpeg_bytes: Optional[bytes] = None
+    if payload.face_image_base64 and payload.face_image_base64.strip():
+        try:
+            jpeg_bytes = extract_jpeg_bytes_from_base64(payload.face_image_base64)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
 
     resolved_shift_id: Optional[int] = None
     if payload.shift_id:
@@ -666,9 +708,32 @@ def create_collaborator(
             )
         resolved_shift_id = shift_obj.id
 
+    resolved_branch_id: Optional[int] = None
+    if payload.branch_id:
+        branch_obj = db.get(Branch, payload.branch_id)
+        if not branch_obj or branch_obj.company_id != company.id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La sucursal seleccionada no existe o no pertenece a la empresa.",
+            )
+        resolved_branch_id = branch_obj.id
+
+    resolved_geofence: Optional[Geofence] = None
+    if payload.geofence_id:
+        gf_obj = db.get(Geofence, payload.geofence_id)
+        if not gf_obj or gf_obj.company_id != company.id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="La geocerca seleccionada no existe o no pertenece a la empresa.",
+            )
+        resolved_geofence = gf_obj
+        if resolved_branch_id is None and gf_obj.branch_id:
+            resolved_branch_id = gf_obj.branch_id
+
     collab = Collaborator(
         company_id=company.id,
         shift_id=resolved_shift_id,
+        branch_id=resolved_branch_id,
         employee_no=payload.employee_no,
         first_name=payload.first_name,
         last_name=payload.last_name,
@@ -682,11 +747,38 @@ def create_collaborator(
         user_type=payload.user_type,
         valid_begin_time=payload.valid_begin_time.strip() if payload.valid_begin_time else None,
         valid_end_time=payload.valid_end_time.strip() if payload.valid_end_time else None,
-        face_image_base64=normalized_face,
+        face_image_base64=None,
         is_active=payload.is_active,
         notes=payload.notes.strip() if payload.notes else None,
     )
     db.add(collab)
+    db.flush()
+
+    if resolved_geofence is not None:
+        db.add(
+            GeofenceAssignment(
+                company_id=company.id,
+                collaborator_id=collab.id,
+                branch_id=resolved_branch_id,
+                geofence_id=resolved_geofence.id,
+                event_type="all",
+                priority=10,
+                is_active=True,
+            )
+        )
+
+    if jpeg_bytes is not None:
+        stored_face = store_collaborator_face_image(
+            company_id=company.id,
+            collaborator_id=collab.id,
+            jpeg_bytes=jpeg_bytes,
+            previous_version=None,
+            previous_media_path=None,
+        )
+        collab.face_media_path = stored_face.media_path
+        collab.face_reference_version = stored_face.version
+        collab.face_sha256 = stored_face.sha256
+
     db.commit()
     db.refresh(collab)
 
@@ -846,6 +938,59 @@ def update_collaborator(
                 )
             collab.shift_id = shift_obj.id
 
+    if "branch_id" in payload.model_fields_set:
+        if not payload.branch_id:
+            collab.branch_id = None
+        else:
+            branch_obj = db.get(Branch, payload.branch_id)
+            if not branch_obj or branch_obj.company_id != collab.company_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="La sucursal seleccionada no existe o pertenece a otra empresa.",
+                )
+            collab.branch_id = branch_obj.id
+
+    if "geofence_id" in payload.model_fields_set:
+        existing_direct_assigns = list(
+            db.scalars(
+                select(GeofenceAssignment).where(
+                    GeofenceAssignment.collaborator_id == collab.id,
+                    GeofenceAssignment.event_type == "all",
+                )
+            ).all()
+        )
+        if not payload.geofence_id:
+            for item in existing_direct_assigns:
+                item.is_active = False
+        else:
+            gf_obj = db.get(Geofence, payload.geofence_id)
+            if not gf_obj or gf_obj.company_id != collab.company_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="La geocerca seleccionada no existe o pertenece a otra empresa.",
+                )
+            if collab.branch_id is None and gf_obj.branch_id:
+                collab.branch_id = gf_obj.branch_id
+            if existing_direct_assigns:
+                primary_assign = existing_direct_assigns[0]
+                primary_assign.geofence_id = gf_obj.id
+                primary_assign.branch_id = collab.branch_id
+                primary_assign.is_active = True
+                for extra in existing_direct_assigns[1:]:
+                    extra.is_active = False
+            else:
+                db.add(
+                    GeofenceAssignment(
+                        company_id=collab.company_id,
+                        collaborator_id=collab.id,
+                        branch_id=collab.branch_id,
+                        geofence_id=gf_obj.id,
+                        event_type="all",
+                        priority=10,
+                        is_active=True,
+                    )
+                )
+
     if payload.first_name is not None:
         collab.first_name = payload.first_name.strip()
     if payload.last_name is not None:
@@ -872,11 +1017,31 @@ def update_collaborator(
         collab.valid_end_time = payload.valid_end_time.strip() or None
     if payload.face_image_base64 is not None:
         if payload.face_image_base64.strip() == "":
+            if collab.face_media_path:
+                get_media_storage().delete(collab.face_media_path)
+            collab.face_media_path = None
+            collab.face_reference_version = None
+            collab.face_sha256 = None
             collab.face_image_base64 = None
         else:
-            collab.face_image_base64 = _normalize_and_validate_jpeg_base64(
-                payload.face_image_base64
+            try:
+                jpeg_bytes = extract_jpeg_bytes_from_base64(payload.face_image_base64)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=str(exc),
+                ) from exc
+            stored_face = store_collaborator_face_image(
+                company_id=collab.company_id,
+                collaborator_id=collab.id,
+                jpeg_bytes=jpeg_bytes,
+                previous_version=collab.face_reference_version,
+                previous_media_path=collab.face_media_path,
             )
+            collab.face_media_path = stored_face.media_path
+            collab.face_reference_version = stored_face.version
+            collab.face_sha256 = stored_face.sha256
+            collab.face_image_base64 = None
     if payload.is_active is not None:
         collab.is_active = payload.is_active
     if payload.notes is not None:
@@ -910,6 +1075,8 @@ def delete_collaborator(
                     client.baja_employee([str(sync_rec.id)])
                 except Exception:
                     pass
+    if collab.face_media_path:
+        get_media_storage().delete(collab.face_media_path)
     db.delete(collab)
     db.commit()
 

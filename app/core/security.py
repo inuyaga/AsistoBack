@@ -107,3 +107,52 @@ def decode_access_token(token: str) -> dict[str, Any]:
         settings.SECRET_KEY,
         algorithms=[settings.JWT_ALGORITHM],
     )
+
+
+def hash_opaque_token(token: str) -> str:
+    """Compute a deterministic SHA-256 hex digest for an opaque token or credential."""
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
+def generate_opaque_token(prefix: str) -> tuple[str, str]:
+    """Generate a high-entropy (256-bit) opaque token with prefix and its SHA-256 hash."""
+    raw_secret = secrets.token_urlsafe(32)
+    clean_prefix = prefix.strip().rstrip("_")
+    plaintext = f"{clean_prefix}_{raw_secret}" if clean_prefix else raw_secret
+    return plaintext, hash_opaque_token(plaintext)
+
+
+def create_signed_media_token(
+    media_path: str,
+    sha256: str | None = None,
+    expires_in_seconds: int | None = None,
+) -> tuple[str, datetime]:
+    """Create a short-lived signed JWT token authorizing temporary download of a media_path."""
+    ttl = expires_in_seconds or settings.MOBILE_SIGNED_MEDIA_EXPIRE_SECONDS
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=ttl)
+    payload: dict[str, Any] = {
+        "purpose": "media_download",
+        "media_path": media_path,
+        "sha256": sha256,
+        "iat": now,
+        "exp": expires_at,
+    }
+    signed = jwt.encode(
+        payload,
+        settings.SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+    return signed, expires_at
+
+
+def decode_signed_media_token(token: str) -> dict[str, Any]:
+    """Decode and verify a signed media download token."""
+    data = jwt.decode(
+        token,
+        settings.SECRET_KEY,
+        algorithms=[settings.JWT_ALGORITHM],
+    )
+    if data.get("purpose") != "media_download" or not data.get("media_path"):
+        raise ValueError("Token de descarga media inválido")
+    return data
