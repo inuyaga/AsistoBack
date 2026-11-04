@@ -1,5 +1,3 @@
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 import subprocess
@@ -11,10 +9,13 @@ if str(_project_root) not in sys.path:
 
 # Si se ejecuta con el Python global sin activar .venv, redirigir automáticamente a .venv
 if sys.prefix == sys.base_prefix:
-    _venv_python = _project_root / ".venv" / "Scripts" / "python.exe"
-    if _venv_python.exists():
-        _env = {**os.environ, "PYTHONPATH": str(_project_root)}
-        raise SystemExit(subprocess.call([str(_venv_python), *sys.argv], env=_env))
+    for _candidate in (
+        _project_root / ".venv" / "bin" / "python",
+        _project_root / ".venv" / "Scripts" / "python.exe",
+    ):
+        if _candidate.exists():
+            _env = {**os.environ, "PYTHONPATH": str(_project_root)}
+            raise SystemExit(subprocess.call([str(_candidate), *sys.argv], env=_env))
 
 import uvicorn  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
@@ -23,28 +24,14 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware  # noqa: E402
 
 from app.api import api_router  # noqa: E402
 from app.api.routes.mobile import MobileAPIError, mobile_api_error_handler, router as mobile_router  # noqa: E402
-from app.cli import ensure_tables_and_defaults  # noqa: E402
 from app.core.config import settings  # noqa: E402
-from app.core.database import SessionLocal  # noqa: E402
 import app.models  # noqa: E402, F401 - register ORM models with Base.metadata
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
-    """Attempt to initialize database tables and base permissions on startup if PostgreSQL is reachable."""
-    try:
-        with SessionLocal() as db:
-            ensure_tables_and_defaults(db)
-    except Exception:
-        pass
-    yield
 
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
-    lifespan=lifespan,
 )
 
 app.add_middleware(

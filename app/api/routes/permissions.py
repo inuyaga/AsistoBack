@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 
 from app.api.deps import SessionDep, require_permissions
-from app.cli import ensure_tables_and_defaults
+from app.cli import DEFAULT_PERMISSIONS, sync_base_permissions_and_roles
 from app.models.user import Permission, Role
 from app.schemas.user import (
     PermissionCreate,
@@ -23,7 +23,12 @@ router = APIRouter()
     summary="Listar todos los permisos",
 )
 def list_permissions(db: SessionDep) -> list[Permission]:
-    return list(db.scalars(select(Permission).order_by(Permission.code)).all())
+    existing = list(db.scalars(select(Permission).order_by(Permission.code)).all())
+    existing_codes = {p.code for p in existing}
+    if any(code not in existing_codes for code, _, _ in DEFAULT_PERMISSIONS):
+        sync_base_permissions_and_roles(db)
+        existing = list(db.scalars(select(Permission).order_by(Permission.code)).all())
+    return existing
 
 
 @router.post(
@@ -98,7 +103,7 @@ def update_permission(
     summary="Sincronizar permisos y rol admin base del sistema",
 )
 def sync_default_permissions(db: SessionDep) -> list[Permission]:
-    ensure_tables_and_defaults(db)
+    sync_base_permissions_and_roles(db)
     return list(db.scalars(select(Permission).order_by(Permission.code)).all())
 
 
