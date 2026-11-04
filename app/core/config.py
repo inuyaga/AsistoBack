@@ -1,6 +1,6 @@
 from pathlib import Path
-from typing import Literal, Optional
-from pydantic import computed_field
+from typing import Any, Literal, Optional
+from pydantic import computed_field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _BACK_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -60,6 +60,25 @@ class Settings(BaseSettings):
         case_sensitive=True,
         extra="ignore",
     )
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _strip_surrounding_quotes(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                v = v[1:-1].strip()
+        return v
+
+    @field_validator("API_V1_STR", mode="after")
+    @classmethod
+    def _normalize_api_v1_str(cls, v: str) -> str:
+        cleaned = v.strip().strip("\"'").strip()
+        if not cleaned:
+            return "/api/v1"
+        if not cleaned.startswith("/"):
+            cleaned = f"/{cleaned}"
+        return cleaned.rstrip("/") or "/api/v1"
 
     @computed_field  # type: ignore[prop-decorator]
     @property
