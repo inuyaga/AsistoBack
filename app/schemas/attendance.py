@@ -266,6 +266,9 @@ class CalculatedDailyAttendanceItem(BaseModel):
     gross_worked_minutes: int = 0
     net_worked_minutes: int = 0
     net_worked_hours: float = 0.0
+    scheduled_worked_minutes: int = 0
+    scheduled_worked_hours: float = 0.0
+    missing_worked_minutes: int = 0
     logs_count: int = 0
     logs: list[AttendanceLogRead] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)

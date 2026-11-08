@@ -1915,7 +1915,7 @@ def list_employee_attendance_history(
 
     conds = [
         DailyAttendance.collaborator_id == collab.id,
-        DailyAttendance.has_attendance.is_(True),
+        DailyAttendance.actual_check_in.is_not(None),
     ]
     if from_date is not None:
         conds.append(DailyAttendance.attendance_date >= from_date)

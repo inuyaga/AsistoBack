@@ -410,6 +410,49 @@ def _has_shift_changed(
     return False
 
 
+def _calculate_shift_required_minutes(
+    eff_shift: Optional[ShiftRuleSnapshot],
+    eval_date: date,
+    tz: tzinfo,
+) -> tuple[int, int, int, int]:
+    """Return `(scheduled_gross_minutes, scheduled_meal_minutes, scheduled_net_minutes, min_required_minutes)` for a shift."""
+    if eff_shift is None:
+        return 0, 0, 0, 0
+
+    sched_in_time = _parse_hhmm_to_time(eff_shift.check_in_time, time(9, 0))
+    sched_out_time = _parse_hhmm_to_time(eff_shift.check_out_time, time(18, 0))
+    sched_in_dt = datetime.combine(eval_date, sched_in_time, tzinfo=tz)
+    sched_out_dt = datetime.combine(eval_date, sched_out_time, tzinfo=tz)
+    if sched_out_dt <= sched_in_dt:
+        sched_out_dt += timedelta(days=1)
+
+    scheduled_gross_minutes = max(0, int((sched_out_dt - sched_in_dt).total_seconds() // 60))
+    scheduled_meal_minutes = 0
+    if eff_shift.has_meal_break:
+        if eff_shift.meal_duration_minutes is not None and eff_shift.meal_duration_minutes > 0:
+            scheduled_meal_minutes = eff_shift.meal_duration_minutes
+        elif eff_shift.meal_start_time and eff_shift.meal_end_time:
+            m_start_t = _parse_hhmm_to_time(eff_shift.meal_start_time, time(14, 0))
+            m_end_t = _parse_hhmm_to_time(eff_shift.meal_end_time, time(15, 0))
+            m_start_dt = datetime.combine(eval_date, m_start_t, tzinfo=tz)
+            m_end_dt = datetime.combine(eval_date, m_end_t, tzinfo=tz)
+            if m_end_dt <= m_start_dt:
+                m_end_dt += timedelta(days=1)
+            scheduled_meal_minutes = max(0, int((m_end_dt - m_start_dt).total_seconds() // 60))
+
+    scheduled_net_minutes = max(0, scheduled_gross_minutes - scheduled_meal_minutes)
+    early_tol = max(0, eff_shift.early_leave_tolerance_minutes or 0)
+    min_required_minutes = (
+        max(1, scheduled_net_minutes - early_tol) if scheduled_net_minutes > 0 else 0
+    )
+    return (
+        scheduled_gross_minutes,
+        scheduled_meal_minutes,
+        scheduled_net_minutes,
+        min_required_minutes,
+    )
+
+
 def _calculate_collaborator_day_attendance(
     collab: Collaborator,
     eval_date: date,
@@ -443,10 +486,10 @@ def _calculate_collaborator_day_attendance(
             else 0
         )
         notes = [
-            "El colaborador no tiene un turno laboral asignado. Asigna un turno para evaluar días laborales, descansos, retardos y comida."
+            "El colaborador no tiene un turno laboral asignado. Asigna un turno para evaluar días laborales, descansos, retardos, comida y cumplimiento de la jornada completa."
         ]
         if day_logs:
-            notes.append(f"Se registraron {len(day_logs)} checada(s) en esta fecha.")
+            notes.append(f"Se registraron {len(day_logs)} checada(s) en esta fecha (no cuenta como asistencia al no tener turno asignado).")
 
         return CalculatedDailyAttendanceItem(
             date=eval_date.isoformat(),
@@ -489,7 +532,7 @@ def _calculate_collaborator_day_attendance(
             actual_check_out_time=local_out_str,
             status="no_shift",
             status_label="Sin Turno Asignado",
-            has_attendance=bool(effective_logs),
+            has_attendance=False,
             late_minutes=0,
             early_leave_minutes=0,
             meal_taken_minutes=None,
@@ -497,6 +540,9 @@ def _calculate_collaborator_day_attendance(
             gross_worked_minutes=gross_min,
             net_worked_minutes=gross_min,
             net_worked_hours=round(gross_min / 60.0, 2),
+            scheduled_worked_minutes=0,
+            scheduled_worked_hours=0.0,
+            missing_worked_minutes=0,
             logs_count=len(day_logs),
             logs=log_reads,
             notes=notes,
@@ -506,6 +552,13 @@ def _calculate_collaborator_day_attendance(
     working_days = eff_shift.working_days_list
     is_working_day = weekday in working_days
     day_type_label = "Día Laboral" if is_working_day else "Día de Descanso"
+    (
+        _scheduled_gross_min,
+        scheduled_meal_min,
+        scheduled_net_min,
+        min_required_min,
+    ) = _calculate_shift_required_minutes(eff_shift, eval_date, tz)
+    scheduled_worked_hours = round(scheduled_net_min / 60.0, 2)
 
     # Sin registros de checada en el día
     if not effective_logs:
@@ -517,13 +570,13 @@ def _calculate_collaborator_day_attendance(
             status_code = "scheduled"
             status_label = "Programado"
             notes = [
-                f"Día laboral futuro programado ({eff_shift.check_in_time} a {eff_shift.check_out_time})."
+                f"Día laboral futuro programado ({eff_shift.check_in_time} a {eff_shift.check_out_time} • Jornada requerida: {scheduled_worked_hours} hrs)."
             ]
         else:
             status_code = "absent"
             status_label = "Falta / Sin Asistencia"
             notes = [
-                f"No se encontraron checadas en día laboral ({eff_shift.check_in_time} a {eff_shift.check_out_time})."
+                f"No se encontraron checadas en día laboral ({eff_shift.check_in_time} a {eff_shift.check_out_time} • Jornada requerida: {scheduled_worked_hours} hrs)."
             ]
 
         if shift_changed:
@@ -580,6 +633,9 @@ def _calculate_collaborator_day_attendance(
             gross_worked_minutes=0,
             net_worked_minutes=0,
             net_worked_hours=0.0,
+            scheduled_worked_minutes=scheduled_net_min,
+            scheduled_worked_hours=scheduled_worked_hours,
+            missing_worked_minutes=scheduled_net_min if (is_working_day and eval_date <= today_local) else 0,
             logs_count=0,
             logs=[],
             notes=notes,
@@ -623,7 +679,7 @@ def _calculate_collaborator_day_attendance(
             )
     else:
         notes.append(
-            f"Asistencia registrada en día de descanso a las {local_in_dt.strftime('%H:%M')}."
+            f"Checada de entrada registrada en día de descanso a las {local_in_dt.strftime('%H:%M')}."
         )
 
     meal_taken_minutes: Optional[int] = None
@@ -657,6 +713,13 @@ def _calculate_collaborator_day_attendance(
         )
         if meal_taken_minutes is not None:
             net_worked_minutes = max(0, gross_worked_minutes - meal_taken_minutes)
+        elif eff_shift.has_meal_break and scheduled_meal_min > 0 and gross_worked_minutes > (scheduled_net_min // 2):
+            # Si el turno contempla comida y la estancia supera media jornada sin checadas intermedias de comida,
+            # descontar el tiempo de comida programado del turno para obtener las horas netas reales trabajadas.
+            net_worked_minutes = max(0, gross_worked_minutes - scheduled_meal_min)
+            notes.append(
+                f"Se descontaron {scheduled_meal_min} min de horario de comida del turno (no se registraron checadas intermedias de comida)."
+            )
         else:
             net_worked_minutes = gross_worked_minutes
 
@@ -676,27 +739,54 @@ def _calculate_collaborator_day_attendance(
     else:
         notes.append("Sin checada de salida registrada.")
 
+    net_worked_hours = round(net_worked_minutes / 60.0, 2)
+
+    # Validar cumplimiento de la jornada completa de acuerdo al número de horas trabajadas del turno asignado
+    is_full_shift_completed = bool(
+        check_out_log is not None and net_worked_minutes >= min_required_min
+    )
+    missing_worked_minutes = (
+        max(0, scheduled_net_min - net_worked_minutes) if not is_full_shift_completed else 0
+    )
+
+    if check_out_log is None:
+        final_status: AttendanceStatusCode = "incomplete"
+        final_label = (
+            f"Jornada Incompleta (Sin Salida • Retardo +{late_minutes}m)"
+            if is_late
+            else "Jornada Incompleta (Sin Salida)"
+        )
+        has_valid_attendance = False
+        notes.append(
+            f"No se considera asistencia: falta checada de salida y debe cumplir la jornada completa de {scheduled_worked_hours} hrs netas ({scheduled_net_min} min) según su turno '{eff_shift.name}'."
+        )
+    elif not is_full_shift_completed:
+        final_status = "incomplete"
+        final_label = f"Jornada Incompleta ({net_worked_hours}h / {scheduled_worked_hours}h)"
+        has_valid_attendance = False
+        missing_hrs = round(missing_worked_minutes / 60.0, 2)
+        notes.append(
+            f"No se considera asistencia: trabajó {net_worked_hours} hrs ({net_worked_minutes} min) de las {scheduled_worked_hours} hrs ({scheduled_net_min} min) requeridas por el turno '{eff_shift.name}' (faltaron {missing_worked_minutes} min / {missing_hrs} hrs)."
+        )
+    else:
+        has_valid_attendance = True
+        notes.append(
+            f"Jornada laboral completa cumplida: {net_worked_hours} hrs trabajadas ({net_worked_minutes} min) de {scheduled_worked_hours} hrs ({scheduled_net_min} min) requeridas por el turno '{eff_shift.name}'."
+        )
+        if not is_working_day:
+            final_status = "worked_rest_day"
+            final_label = "Descanso Laborado"
+        elif is_late:
+            final_status = "late"
+            final_label = f"Retardo (+{late_minutes} min)"
+        else:
+            final_status = "present"
+            final_label = "Asistencia Puntual"
+
     if shift_changed:
         notes.append(
             f"Histórico congelado con el turno '{eff_shift.name}' ({eff_shift.check_in_time} - {eff_shift.check_out_time})."
         )
-
-    if not is_working_day:
-        final_status: AttendanceStatusCode = "worked_rest_day"
-        final_label = "Descanso Laborado"
-    elif check_out_log is None:
-        if is_late:
-            final_status = "late"
-            final_label = f"Retardo (+{late_minutes} min) • Sin Salida"
-        else:
-            final_status = "incomplete"
-            final_label = "Asistencia (Sin Salida)"
-    elif is_late:
-        final_status = "late"
-        final_label = f"Retardo (+{late_minutes} min)"
-    else:
-        final_status = "present"
-        final_label = "Asistencia Puntual"
 
     return CalculatedDailyAttendanceItem(
         date=eval_date.isoformat(),
@@ -739,14 +829,17 @@ def _calculate_collaborator_day_attendance(
         actual_check_out_time=local_out_dt.strftime("%H:%M:%S") if local_out_dt else None,
         status=final_status,
         status_label=final_label,
-        has_attendance=True,
+        has_attendance=has_valid_attendance,
         late_minutes=late_minutes,
         early_leave_minutes=early_leave_minutes,
         meal_taken_minutes=meal_taken_minutes,
         meal_excess_minutes=meal_excess_minutes,
         gross_worked_minutes=gross_worked_minutes,
         net_worked_minutes=net_worked_minutes,
-        net_worked_hours=round(net_worked_minutes / 60.0, 2),
+        net_worked_hours=net_worked_hours,
+        scheduled_worked_minutes=scheduled_net_min,
+        scheduled_worked_hours=scheduled_worked_hours,
+        missing_worked_minutes=missing_worked_minutes,
         logs_count=len(day_logs),
         logs=log_reads,
         notes=notes,
@@ -817,8 +910,8 @@ def _build_item_from_persisted_record(
 ) -> CalculatedDailyAttendanceItem:
     current_shift = collab.shift
     snapshot = ShiftRuleSnapshot.from_daily_record(record)
+    rec_tz = _resolve_tz(snapshot.timezone if snapshot else record.timezone)
     if day_logs:
-        rec_tz = _resolve_tz(snapshot.timezone if snapshot else record.timezone)
         _classify_logs_by_shift(
             _deduplicate_rapid_logs(day_logs),
             record.attendance_date,
@@ -831,6 +924,16 @@ def _build_item_from_persisted_record(
         notes.append(
             f"Histórico congelado con el turno '{snapshot.name}' ({snapshot.check_in_time} - {snapshot.check_out_time})."
         )
+
+    _, _, scheduled_net_min, _ = _calculate_shift_required_minutes(
+        snapshot, record.attendance_date, rec_tz
+    )
+    scheduled_worked_hours = round(scheduled_net_min / 60.0, 2)
+    missing_worked_min = (
+        max(0, scheduled_net_min - record.net_worked_minutes)
+        if (not record.has_attendance and scheduled_net_min > 0 and record.status in ("incomplete", "absent"))
+        else 0
+    )
 
     weekday_idx = max(0, min(6, record.weekday))
     status_val: AttendanceStatusCode = (
@@ -902,6 +1005,9 @@ def _build_item_from_persisted_record(
         gross_worked_minutes=record.gross_worked_minutes,
         net_worked_minutes=record.net_worked_minutes,
         net_worked_hours=record.net_worked_hours,
+        scheduled_worked_minutes=scheduled_net_min,
+        scheduled_worked_hours=scheduled_worked_hours,
+        missing_worked_minutes=missing_worked_min,
         logs_count=len(day_logs) if day_logs else record.logs_count,
         logs=[AttendanceLogRead.model_validate(lg) for lg in day_logs],
         notes=notes,
@@ -1528,26 +1634,44 @@ def get_calculated_attendance_report(
                     _apply_calculated_item_to_record(existing_record, item, eval_d, new_snapshot)
                     dirty_persistence = True
                     item = _build_item_from_persisted_record(existing_record, collab, day_logs)
-                elif not existing_record.is_locked and len(day_logs) != existing_record.logs_count:
-                    # Llegaron nuevas checadas en el día (ej. comida o salida) o se eliminó un log:
-                    # recalcular las marcas USANDO EL SNAPSHOT CONGELADO DE ESE DÍA (nunca el turno nuevo)
+                elif not existing_record.is_locked:
                     hist_tz = _resolve_tz(
                         frozen_snapshot.timezone if frozen_snapshot else existing_record.timezone
                     )
-                    item = _calculate_collaborator_day_attendance(
-                        collab=collab,
-                        eval_date=eval_d,
-                        day_logs=day_logs,
-                        today_local=today_local,
-                        tz=hist_tz,
-                        shift_snapshot=frozen_snapshot,
-                        use_explicit_snapshot=True,
+                    _, sched_meal_m, sched_net_m, min_req_m = _calculate_shift_required_minutes(
+                        frozen_snapshot, eval_d, hist_tz
                     )
-                    _apply_calculated_item_to_record(existing_record, item, eval_d, frozen_snapshot)
-                    dirty_persistence = True
+                    needs_recalc = (
+                        len(day_logs) != existing_record.logs_count
+                        or (existing_record.status in ("incomplete", "no_shift") and existing_record.has_attendance)
+                        or (existing_record.actual_check_in is not None and existing_record.actual_check_out is None and (existing_record.has_attendance or existing_record.status != "incomplete"))
+                        or (frozen_snapshot is not None and existing_record.has_attendance and existing_record.net_worked_minutes < min_req_m)
+                        or (
+                            frozen_snapshot is not None
+                            and frozen_snapshot.has_meal_break
+                            and sched_meal_m > 0
+                            and existing_record.meal_taken_minutes is None
+                            and existing_record.actual_check_out is not None
+                            and existing_record.net_worked_minutes == existing_record.gross_worked_minutes
+                            and existing_record.gross_worked_minutes > (sched_net_m // 2)
+                        )
+                    )
+                    if needs_recalc:
+                        # Recalcular las marcas USANDO EL SNAPSHOT CONGELADO DE ESE DÍA (nunca el turno nuevo)
+                        item = _calculate_collaborator_day_attendance(
+                            collab=collab,
+                            eval_date=eval_d,
+                            day_logs=day_logs,
+                            today_local=today_local,
+                            tz=hist_tz,
+                            shift_snapshot=frozen_snapshot,
+                            use_explicit_snapshot=True,
+                        )
+                        _apply_calculated_item_to_record(existing_record, item, eval_d, frozen_snapshot)
+                        dirty_persistence = True
                     item = _build_item_from_persisted_record(existing_record, collab, day_logs)
                 else:
-                    # Devolver directamente el registro histórico guardado sin recalcular
+                    # Devolver directamente el registro histórico bloqueado sin recalcular
                     item = _build_item_from_persisted_record(existing_record, collab, day_logs)
             else:
                 # Primera vez que se evalúa esta fecha (<= hoy): calcular con el turno actual y congelar en daily_attendances
@@ -1636,9 +1760,9 @@ def get_calculated_attendance_report(
     with_shift = sum(1 for c in eff_collabs if c.shift_id is not None)
     without_shift = len(eff_collabs) - with_shift
 
-    # Porcentaje de asistencia sobre días laborales ya transcurridos o en curso
+    # Porcentaje de asistencia sobre días laborales (únicamente cuentan como asistidos los días con jornada completa cumplida)
     actionable_working_days = present_count + late_count + incomplete_count + absent_count
-    attended_working_days = present_count + late_count + incomplete_count
+    attended_working_days = present_count + late_count
     attendance_rate = (
         round((attended_working_days / actionable_working_days) * 100.0, 1)
         if actionable_working_days > 0

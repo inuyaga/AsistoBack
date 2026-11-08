@@ -829,7 +829,7 @@ def seed_test_data(db: Session) -> dict[str, int]:
             None,
             "mobile_device",
             sample_workday,
-            time(18, 10, 0),
+            time(18, 22, 0),
             "checkOut",
             "Salida desde App Móvil",
             geo1,
