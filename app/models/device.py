@@ -26,6 +26,8 @@ class HikvisionDevice(Base):
     location: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
 
     protocol: Mapped[str] = mapped_column(String(10), default="http", nullable=False)
+    connection_mode: Mapped[str] = mapped_column(String(20), default="isapi", nullable=False)
+    isup_device_id: Mapped[Optional[str]] = mapped_column(String(256), index=True, nullable=True)
     ip_address: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
     port: Mapped[int] = mapped_column(Integer, default=80, nullable=False)
     username: Mapped[str] = mapped_column(String(64), default="admin", nullable=False)
@@ -80,6 +82,8 @@ class HikvisionDevice(Base):
 
     @property
     def base_url(self) -> str:
+        if (self.connection_mode or "isapi").lower() == "isup":
+            return f"isup://{self.isup_device_id or self.device_id_code or self.ip_address}"
         return f"{self.protocol}://{self.ip_address}:{self.port}"
 
     @property

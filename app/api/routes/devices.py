@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 import json
+import re
+import secrets
 from typing import Any, Callable, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
@@ -19,6 +21,7 @@ from app.core.isapi import (
     ISAPIError,
     IsapiGenerateXmlController,
 )
+from app.core.isup_client import HikvisionISUPClient, IsupSidecarClient
 from app.core.security import decrypt_secret, encrypt_secret
 from app.models.attendance import AttendanceLog
 from app.models.collaborator import Collaborator, CollaboratorDeviceSync, Company
@@ -51,6 +54,11 @@ from app.schemas.device import (
     ISAPISaveFaceRequest,
     ISAPITestConnectionRequest,
     ISAPIWebhookEventResponse,
+    ISUPConnectedDeviceItem,
+    ISUPConnectedDevicesResponse,
+    ISUPProvisioningInfoResponse,
+    ISUPSidecarHealthResponse,
+    ISUPStatusSyncResponse,
 )
 
 router = APIRouter()
@@ -125,6 +133,21 @@ def _push_notification_config_to_device(
         return False, exc.message
 
 
+def _generate_unique_isup_device_id(db: SessionDep, company_code: Optional[str] = None) -> str:
+    """Genera un Device ID único solo con letras y números (A-Z, 0-9), sin guiones ni símbolos."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    clean_prefix = re.sub(r"[^A-Z0-9]", "", (company_code or "BIO").upper())[:6] or "BIO"
+    for _ in range(25):
+        suffix = "".join(secrets.choice(alphabet) for _ in range(6))
+        candidate = f"ASISTO{clean_prefix}{suffix}"
+        exists = db.scalar(
+            select(HikvisionDevice.id).where(HikvisionDevice.isup_device_id == candidate)
+        )
+        if not exists:
+            return candidate
+    return "ASISTO" + "".join(secrets.choice(alphabet) for _ in range(10))
+
+
 def _get_device_or_404(db: SessionDep, device_id: int) -> HikvisionDevice:
     device = db.get(HikvisionDevice, device_id)
     if not device:
@@ -136,6 +159,18 @@ def _get_device_or_404(db: SessionDep, device_id: int) -> HikvisionDevice:
 
 
 def _build_isapi_client(device: HikvisionDevice) -> HikvisionISAPIClient:
+    if (device.connection_mode or "isapi").lower() == "isup":
+        isup_id = (device.isup_device_id or device.device_id_code or "").strip()
+        if not isup_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"El dispositivo '{device.name}' está configurado en modo ISUP pero no tiene 'isup_device_id'.",
+            )
+        return HikvisionISUPClient(
+            isup_device_id=isup_id,
+            timeout_seconds=device.timeout_seconds,
+        )
+
     try:
         plain_password = decrypt_secret(device.encrypted_password)
     except ValueError as exc:
@@ -184,19 +219,23 @@ def _apply_probe_to_device(device: HikvisionDevice, probe_data: dict[str, object
 def list_devices(
     db: SessionDep,
     company_id: Optional[int] = Query(default=None, description="Filtrar por empresa propietaria del reloj"),
-    search: Optional[str] = Query(default=None, description="Filtrar por nombre, IP, serie o ubicación"),
+    search: Optional[str] = Query(default=None, description="Filtrar por nombre, IP, ISUP DeviceID, serie o ubicación"),
+    connection_mode: Optional[Literal["isapi", "isup"]] = Query(default=None, description="Filtrar por transporte (isapi / isup)"),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     is_active: Optional[bool] = Query(default=None),
 ) -> list[HikvisionDevice]:
     stmt = select(HikvisionDevice)
     if company_id is not None:
         stmt = stmt.where(HikvisionDevice.company_id == company_id)
+    if connection_mode is not None:
+        stmt = stmt.where(HikvisionDevice.connection_mode == connection_mode)
     if search and search.strip():
         term = f"%{search.strip()}%"
         stmt = stmt.where(
             or_(
                 HikvisionDevice.name.ilike(term),
                 HikvisionDevice.ip_address.ilike(term),
+                HikvisionDevice.isup_device_id.ilike(term),
                 HikvisionDevice.location.ilike(term),
                 HikvisionDevice.serial_number.ilike(term),
                 HikvisionDevice.model.ilike(term),
@@ -216,7 +255,7 @@ def list_devices(
     response_model=HikvisionDeviceRead,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permissions("devices:write"))],
-    summary="Registrar un nuevo reloj checador Hikvision",
+    summary="Registrar un nuevo reloj checador Hikvision (ISAPI directo o ISUP 5.0)",
 )
 def create_device(db: SessionDep, payload: HikvisionDeviceCreate) -> HikvisionDevice:
     company = db.get(Company, payload.company_id)
@@ -235,27 +274,55 @@ def create_device(db: SessionDep, payload: HikvisionDeviceCreate) -> HikvisionDe
             detail=f"Ya existe un reloj registrado con el nombre '{payload.name}'",
         )
 
-    existing_endpoint = db.scalar(
-        select(HikvisionDevice).where(
-            HikvisionDevice.ip_address == payload.ip_address,
-            HikvisionDevice.port == payload.port,
+    resolved_isup_device_id: Optional[str] = payload.isup_device_id
+    auto_generated_isup_id = False
+
+    if payload.connection_mode == "isup":
+        if not resolved_isup_device_id:
+            resolved_isup_device_id = _generate_unique_isup_device_id(db, company.code)
+            auto_generated_isup_id = True
+        else:
+            existing_isup = db.scalar(
+                select(HikvisionDevice).where(HikvisionDevice.isup_device_id == resolved_isup_device_id)
+            )
+            if existing_isup:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Ya existe un reloj registrado con el ISUP DeviceID '{resolved_isup_device_id}' ('{existing_isup.name}')",
+                )
+    else:
+        existing_endpoint = db.scalar(
+            select(HikvisionDevice).where(
+                HikvisionDevice.connection_mode == "isapi",
+                HikvisionDevice.ip_address == payload.ip_address,
+                HikvisionDevice.port == payload.port,
+            )
         )
+        if existing_endpoint:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Ya existe un reloj con la dirección {payload.ip_address}:{payload.port} ('{existing_endpoint.name}')",
+            )
+
+    effective_ip = (
+        payload.ip_address
+        if payload.connection_mode == "isapi"
+        else (payload.ip_address if payload.ip_address and payload.ip_address != "0.0.0.0" else "0.0.0.0")
     )
-    if existing_endpoint:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Ya existe un reloj con la dirección {payload.ip_address}:{payload.port} ('{existing_endpoint.name}')",
-        )
+    effective_port = payload.port if payload.connection_mode == "isapi" else (payload.port or 7660)
+    raw_password = (payload.password or "").strip() if payload.password else ""
 
     device = HikvisionDevice(
         company_id=company.id,
         name=payload.name,
         location=payload.location,
+        connection_mode=payload.connection_mode,
+        isup_device_id=resolved_isup_device_id,
         protocol=payload.protocol,
-        ip_address=payload.ip_address,
-        port=payload.port,
+        ip_address=effective_ip,
+        port=effective_port,
         username=payload.username,
-        encrypted_password=encrypt_secret(payload.password),
+        encrypted_password=encrypt_secret(raw_password) if raw_password else "",
         verify_ssl=payload.verify_ssl,
         timeout_seconds=payload.timeout_seconds,
         is_active=payload.is_active,
@@ -263,16 +330,10 @@ def create_device(db: SessionDep, payload: HikvisionDeviceCreate) -> HikvisionDe
         status="unknown",
     )
 
-    if payload.test_on_create:
-        client = HikvisionISAPIClient(
-            ip_address=payload.ip_address,
-            port=payload.port,
-            username=payload.username,
-            password=payload.password,
-            protocol=payload.protocol,
-            verify_ssl=payload.verify_ssl,
-            timeout_seconds=payload.timeout_seconds,
-        )
+    # Si el Device ID ISUP acaba de generarse automáticamente, el equipo físico aún no está configurado;
+    # omitir la prueba inmediata para evitar un falso error antes de cargar el Device ID en el biométrico.
+    if payload.test_on_create and not auto_generated_isup_id:
+        client = _build_isapi_client(device)
         try:
             probe_data = client.probe_device()
             _apply_probe_to_device(device, probe_data)
@@ -769,6 +830,7 @@ def _resolve_webhook_device(
         device = db.scalar(
             select(HikvisionDevice).where(
                 or_(
+                    HikvisionDevice.isup_device_id == device_id_code,
                     HikvisionDevice.device_id_code == device_id_code,
                     HikvisionDevice.serial_number == device_id_code,
                 )
@@ -1282,42 +1344,271 @@ def delete_attendance_log(
         sync_collaborator_daily_attendance(db, collab_id, evt_time)
 
 
+@router.get(
+    "/isup/provisioning",
+    response_model=ISUPProvisioningInfoResponse,
+    dependencies=[Depends(require_permissions("devices:write"))],
+    summary="Obtener parámetros globales de aprovisionamiento ISUP 5.0 (Host, Puerto 7660 y Encryption Key)",
+)
+def get_isup_provisioning_info(
+    db: SessionDep,
+    company_id: Optional[int] = Query(default=None, description="Empresa opcional para sugerir un Device ID"),
+) -> ISUPProvisioningInfoResponse:
+    company_code: Optional[str] = None
+    if company_id is not None:
+        company = db.get(Company, company_id)
+        if company:
+            company_code = company.code
+
+    return ISUPProvisioningInfoResponse(
+        protocol="ISUP 5.0",
+        server_host=(settings.ISUP_SERVER_HOST or settings.APP_HOST).strip(),
+        server_port=settings.ISUP_SERVER_PORT,
+        encryption_key=settings.ISUP_ENCRYPTION_KEY,
+        isup_enabled=settings.isup_enabled,
+        suggested_device_id=_generate_unique_isup_device_id(db, company_code),
+    )
+
+
+@router.get(
+    "/isup/health",
+    response_model=ISUPSidecarHealthResponse,
+    dependencies=[Depends(require_permissions("devices:read"))],
+    summary="Consultar salud del microservicio sidecar ISUP 5.0 (.NET 8)",
+)
+def get_isup_sidecar_health() -> ISUPSidecarHealthResponse:
+    if not settings.isup_enabled:
+        return ISUPSidecarHealthResponse(
+            configured=False,
+            reachable=False,
+            status="disabled",
+            sidecar_url=None,
+            message="ISUP_SIDECAR_URL no está configurado en el backend.",
+        )
+
+    sidecar = IsupSidecarClient()
+    try:
+        data = sidecar.health()
+        is_listening = bool(data.get("isupListening", False))
+        return ISUPSidecarHealthResponse(
+            configured=True,
+            reachable=True,
+            status=str(data.get("status") or ("healthy" if is_listening else "degraded")),
+            sidecar_url=sidecar.base_url,
+            isup_initialized=bool(data.get("isupInitialized", False)),
+            isup_listening=is_listening,
+            listen_endpoint=data.get("listenEndpoint"),
+            sdk_build_version=data.get("sdkBuildVersion"),
+            online_devices=int(data.get("onlineDevices") or 0),
+            total_known_devices=int(data.get("totalKnownDevices") or 0),
+            started_at_utc=data.get("startedAtUtc"),
+            message=(
+                f"Sidecar ISUP 5.0 activo en {data.get('listenEndpoint')} ({data.get('onlineDevices', 0)} equipo(s) en línea)"
+                if is_listening
+                else f"Sidecar alcanzable pero sin escucha ISUP activa: {data.get('lastStartupError') or 'revisa logs'}"
+            ),
+        )
+    except ISAPIError as exc:
+        return ISUPSidecarHealthResponse(
+            configured=True,
+            reachable=False,
+            status="unreachable",
+            sidecar_url=sidecar.base_url,
+            message=exc.message,
+        )
+
+
+@router.get(
+    "/isup/connected",
+    response_model=ISUPConnectedDevicesResponse,
+    dependencies=[Depends(require_permissions("devices:read"))],
+    summary="Listar biométricos conectados en tiempo real al sidecar ISUP 5.0 (enriquecidos con BD local)",
+)
+def list_isup_connected_devices(
+    db: SessionDep,
+    online_only: bool = Query(default=False, description="Mostrar únicamente dispositivos actualmente en línea"),
+) -> ISUPConnectedDevicesResponse:
+    sidecar = IsupSidecarClient()
+    try:
+        raw = sidecar.list_devices(online_only=online_only)
+    except ISAPIError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=exc.message,
+        ) from exc
+
+    raw_devices = raw.get("devices") if isinstance(raw.get("devices"), list) else []
+    db_devices = list(
+        db.scalars(
+            select(HikvisionDevice).where(HikvisionDevice.isup_device_id.is_not(None))
+        ).all()
+    )
+    by_isup_id = {d.isup_device_id: d for d in db_devices if d.isup_device_id}
+
+    items: list[ISUPConnectedDeviceItem] = []
+    for entry in raw_devices:
+        if not isinstance(entry, dict):
+            continue
+        dev_id_str = str(entry.get("deviceId") or "").strip()
+        if not dev_id_str:
+            continue
+        linked = by_isup_id.get(dev_id_str)
+        items.append(
+            ISUPConnectedDeviceItem(
+                isup_device_id=dev_id_str,
+                is_online=bool(entry.get("isOnline", False)),
+                ip_address=entry.get("ipAddress"),
+                port=_safe_int(entry.get("port")),
+                device_name=entry.get("deviceName"),
+                serial_number=entry.get("serialNumber"),
+                full_serial_number=entry.get("fullSerialNumber"),
+                firmware_version=entry.get("firmwareVersion"),
+                protocol_version=entry.get("protocolVersion"),
+                connected_at_utc=entry.get("connectedAtUtc"),
+                last_seen_utc=entry.get("lastSeenUtc"),
+                disconnected_at_utc=entry.get("disconnectedAtUtc"),
+                linked_device_id=linked.id if linked else None,
+                linked_device_name=linked.name if linked else None,
+                linked_company_id=linked.company_id if linked else None,
+                linked_company_name=linked.company_name if linked else None,
+            )
+        )
+
+    return ISUPConnectedDevicesResponse(
+        count=len(items),
+        online_count=sum(1 for i in items if i.is_online),
+        devices=items,
+    )
+
+
+@router.post(
+    "/isup/sync-status",
+    response_model=ISUPStatusSyncResponse,
+    dependencies=[Depends(require_permissions("devices:isapi"))],
+    summary="Sincronizar estado online/offline y metadatos de todos los relojes ISUP desde el sidecar",
+)
+def sync_isup_devices_status(db: SessionDep) -> ISUPStatusSyncResponse:
+    sidecar = IsupSidecarClient()
+    try:
+        raw = sidecar.list_devices(online_only=False)
+    except ISAPIError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=exc.message,
+        ) from exc
+
+    raw_devices = raw.get("devices") if isinstance(raw.get("devices"), list) else []
+    sidecar_map: dict[str, dict[str, Any]] = {}
+    for entry in raw_devices:
+        if isinstance(entry, dict) and entry.get("deviceId"):
+            sidecar_map[str(entry["deviceId"]).strip()] = entry
+
+    isup_devices = list(
+        db.scalars(
+            select(HikvisionDevice).where(HikvisionDevice.connection_mode == "isup")
+        ).all()
+    )
+
+    now = datetime.now(timezone.utc)
+    online_updated = 0
+    offline_updated = 0
+    linked_ids: set[str] = set()
+
+    for dev in isup_devices:
+        isup_id = (dev.isup_device_id or "").strip()
+        if not isup_id:
+            continue
+        linked_ids.add(isup_id)
+        session = sidecar_map.get(isup_id)
+        if session and bool(session.get("isOnline", False)):
+            dev.status = "online"
+            dev.last_seen_at = _parse_event_datetime(session.get("lastSeenUtc"), now)
+            dev.last_error = None
+            if session.get("ipAddress"):
+                dev.ip_address = str(session["ipAddress"])[:120]
+            if session.get("fullSerialNumber") or session.get("serialNumber"):
+                dev.serial_number = str(session.get("fullSerialNumber") or session.get("serialNumber"))[:120]
+            if session.get("firmwareVersion"):
+                dev.firmware_version = str(session["firmwareVersion"])[:100]
+            online_updated += 1
+        else:
+            dev.status = "offline"
+            if session and session.get("lastSeenUtc"):
+                dev.last_seen_at = _parse_event_datetime(session.get("lastSeenUtc"), now)
+            offline_updated += 1
+
+    db.commit()
+
+    unlinked = sorted(dev_id for dev_id in sidecar_map if dev_id not in linked_ids)
+    return ISUPStatusSyncResponse(
+        total_isup_devices=len(isup_devices),
+        online_updated=online_updated,
+        offline_updated=offline_updated,
+        unlinked_sidecar_devices=unlinked,
+        message=(
+            f"Estado ISUP sincronizado: {online_updated} en línea, {offline_updated} fuera de línea"
+            + (f", {len(unlinked)} equipo(s) conectado(s) sin vincular en BD." if unlinked else ".")
+        ),
+    )
+
+
 @router.post(
     "/test-connection",
     response_model=ISAPIProbeResponse,
     dependencies=[Depends(require_permissions("devices:isapi"))],
-    summary="Probar conexión ISAPI con parámetros directos antes de guardar",
+    summary="Probar conexión ISAPI directa o ISUP 5.0 con parámetros antes de guardar",
 )
 def test_raw_isapi_connection(
     db: SessionDep,
     payload: ISAPITestConnectionRequest,
 ) -> ISAPIProbeResponse:
-    password = payload.password
-    if not password and payload.device_id is not None:
-        existing = _get_device_or_404(db, payload.device_id)
-        password = decrypt_secret(existing.encrypted_password)
+    if payload.connection_mode == "isup":
+        isup_id = (payload.isup_device_id or "").strip()
+        if not isup_id and payload.device_id is not None:
+            existing = _get_device_or_404(db, payload.device_id)
+            isup_id = (existing.isup_device_id or "").strip()
+        if not isup_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Debes proporcionar 'isup_device_id' para probar la conexión en modo ISUP",
+            )
+        client: HikvisionISAPIClient = HikvisionISUPClient(
+            isup_device_id=isup_id,
+            timeout_seconds=payload.timeout_seconds,
+        )
+    else:
+        if not payload.ip_address or not payload.ip_address.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Debes proporcionar 'ip_address' para probar una conexión ISAPI directa",
+            )
+        password = payload.password
+        if not password and payload.device_id is not None:
+            existing = _get_device_or_404(db, payload.device_id)
+            password = decrypt_secret(existing.encrypted_password)
 
-    if not password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Debes proporcionar la contraseña ISAPI para probar la conexión",
+        if not password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Debes proporcionar la contraseña ISAPI para probar la conexión",
+            )
+
+        client = HikvisionISAPIClient(
+            ip_address=payload.ip_address,
+            port=payload.port,
+            username=payload.username,
+            password=password,
+            protocol=payload.protocol,
+            verify_ssl=payload.verify_ssl,
+            timeout_seconds=payload.timeout_seconds,
         )
 
-    client = HikvisionISAPIClient(
-        ip_address=payload.ip_address,
-        port=payload.port,
-        username=payload.username,
-        password=password,
-        protocol=payload.protocol,
-        verify_ssl=payload.verify_ssl,
-        timeout_seconds=payload.timeout_seconds,
-    )
     try:
         probe_data = client.probe_device()
         return ISAPIProbeResponse(
             reachable=True,
             status="online",
-            message=f"Conexión ISAPI exitosa con {client.base_url}",
+            message=f"Conexión {'ISUP 5.0' if payload.connection_mode == 'isup' else 'ISAPI'} exitosa con {client.base_url}",
             **probe_data,
         )
     except ISAPIError as exc:
@@ -1375,11 +1666,40 @@ def update_device(
             )
         device.name = clean_name
 
+    new_mode = payload.connection_mode or device.connection_mode or "isapi"
+    new_isup_id = (
+        payload.isup_device_id.strip() or None
+        if payload.isup_device_id is not None
+        else device.isup_device_id
+    )
+
+    if new_mode == "isup":
+        if not new_isup_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="En modo 'isup' el campo 'isup_device_id' es obligatorio",
+            )
+        if new_isup_id != device.isup_device_id:
+            conflict_isup = db.scalar(
+                select(HikvisionDevice).where(
+                    HikvisionDevice.isup_device_id == new_isup_id,
+                    HikvisionDevice.id != device.id,
+                )
+            )
+            if conflict_isup:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Ya existe otro reloj con el ISUP DeviceID '{new_isup_id}' ('{conflict_isup.name}')",
+                )
+    device.connection_mode = new_mode
+    device.isup_device_id = new_isup_id
+
     new_ip = payload.ip_address.strip() if payload.ip_address is not None else device.ip_address
     new_port = payload.port if payload.port is not None else device.port
-    if new_ip != device.ip_address or new_port != device.port:
+    if new_mode == "isapi" and (new_ip != device.ip_address or new_port != device.port):
         conflict_ep = db.scalar(
             select(HikvisionDevice).where(
+                HikvisionDevice.connection_mode == "isapi",
                 HikvisionDevice.ip_address == new_ip,
                 HikvisionDevice.port == new_port,
                 HikvisionDevice.id != device.id,
@@ -1390,8 +1710,8 @@ def update_device(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Ya existe otro reloj registrado en {new_ip}:{new_port} ('{conflict_ep.name}')",
             )
-        device.ip_address = new_ip
-        device.port = new_port
+    device.ip_address = new_ip
+    device.port = new_port
 
     if payload.location is not None:
         device.location = payload.location.strip() or None

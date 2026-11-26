@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = "attendance_db"
     DATABASE_URL: Optional[str] = None
 
+    # Hikvision ISUP 5.0 Sidecar (.NET 8) Configuration
+    ISUP_SIDECAR_URL: Optional[str] = None
+    ISUP_INTERNAL_API_KEY: str = ""
+    ISUP_INTERNAL_API_HEADER: str = "X-Internal-Api-Key"
+    ISUP_REQUEST_TIMEOUT_SECONDS: float = 15.0
+    ISUP_ENCRYPTION_KEY: str = ""
+    ISUP_SERVER_HOST: Optional[str] = None
+    ISUP_SERVER_PORT: int = 7660
+
     ALLOWED_HOSTS: list[str] = [
         "*",
     ]
@@ -94,6 +103,11 @@ class Settings(BaseSettings):
         if self.MEDIA_PUBLIC_BASE_URL and self.MEDIA_PUBLIC_BASE_URL.strip():
             return self.MEDIA_PUBLIC_BASE_URL.strip().rstrip("/")
         return f"http://{self.APP_HOST}:{self.APP_PORT}{self.API_V1_STR}"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def isup_enabled(self) -> bool:
+        return bool(self.ISUP_SIDECAR_URL and self.ISUP_SIDECAR_URL.strip())
 
     @computed_field  # type: ignore[prop-decorator]
     @property

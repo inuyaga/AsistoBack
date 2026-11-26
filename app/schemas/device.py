@@ -1,7 +1,8 @@
 from datetime import datetime
+import re
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class HikvisionDeviceBase(BaseModel):
@@ -11,8 +12,18 @@ class HikvisionDeviceBase(BaseModel):
     )
     name: str = Field(..., min_length=2, max_length=120, examples=["Reloj Entrada Principal"])
     location: Optional[str] = Field(default=None, max_length=200, examples=["Planta Baja - Recepción"])
+    connection_mode: Literal["isapi", "isup"] = Field(
+        default="isapi",
+        description="Transporte del reloj: 'isapi' (HTTP directo LAN/VPN) o 'isup' (túnel saliente ISUP 5.0 vía sidecar .NET 8)",
+    )
+    isup_device_id: Optional[str] = Field(
+        default=None,
+        max_length=256,
+        description="DeviceID configurado en el biométrico para autenticarse por ISUP 5.0 (requerido si connection_mode='isup')",
+        examples=["BIOMETRICO-SUC01"],
+    )
     protocol: Literal["http", "https"] = Field(default="http")
-    ip_address: str = Field(..., min_length=3, max_length=120, examples=["192.168.1.64"])
+    ip_address: str = Field(default="0.0.0.0", min_length=3, max_length=120, examples=["192.168.1.64"])
     port: int = Field(default=80, ge=1, le=65535, examples=[80])
     username: str = Field(default="admin", min_length=1, max_length=64, examples=["admin"])
     verify_ssl: bool = Field(default=False)
@@ -28,20 +39,49 @@ class HikvisionDeviceBase(BaseModel):
             raise ValueError("El campo no puede estar vacío")
         return cleaned
 
+    @field_validator("isup_device_id")
+    @classmethod
+    def strip_isup_device_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9]+", cleaned):
+            raise ValueError("El Device ID ISUP solo puede contener letras y números (A-Z, 0-9, sin espacios ni guiones)")
+        return cleaned
+
 
 class HikvisionDeviceCreate(HikvisionDeviceBase):
     company_id: int = Field(..., description="ID de la empresa propietaria del reloj")
-    password: str = Field(..., min_length=1, max_length=128, description="Contraseña ISAPI del reloj")
+    password: Optional[str] = Field(
+        default=None,
+        max_length=128,
+        description="Contraseña ISAPI del reloj (obligatoria en modo 'isapi'; opcional en modo 'isup')",
+    )
     test_on_create: bool = Field(
         default=True,
         description="Intentar consultar /ISAPI/System/deviceInfo al registrar el reloj",
     )
+
+    @model_validator(mode="after")
+    def validate_transport_fields(self) -> "HikvisionDeviceCreate":
+        if self.connection_mode == "isup":
+            # Si isup_device_id viene vacío/nulo, el backend generará automáticamente uno único.
+            return self
+        if not self.ip_address or self.ip_address == "0.0.0.0":
+            raise ValueError("En modo 'isapi' debes indicar la dirección IP o host del reloj")
+        if not self.password or not self.password.strip():
+            raise ValueError("En modo 'isapi' la contraseña del reloj es obligatoria")
+        return self
 
 
 class HikvisionDeviceUpdate(BaseModel):
     company_id: Optional[int] = Field(default=None, description="ID de la empresa propietaria del reloj")
     name: Optional[str] = Field(default=None, min_length=2, max_length=120)
     location: Optional[str] = Field(default=None, max_length=200)
+    connection_mode: Optional[Literal["isapi", "isup"]] = None
+    isup_device_id: Optional[str] = Field(default=None, max_length=256)
     protocol: Optional[Literal["http", "https"]] = None
     ip_address: Optional[str] = Field(default=None, min_length=3, max_length=120)
     port: Optional[int] = Field(default=None, ge=1, le=65535)
@@ -56,6 +96,18 @@ class HikvisionDeviceUpdate(BaseModel):
     timeout_seconds: Optional[int] = Field(default=None, ge=2, le=30)
     is_active: Optional[bool] = None
     notes: Optional[str] = Field(default=None, max_length=500)
+
+    @field_validator("isup_device_id")
+    @classmethod
+    def validate_update_isup_device_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9]+", cleaned):
+            raise ValueError("El Device ID ISUP solo puede contener letras y números (A-Z, 0-9, sin espacios ni guiones)")
+        return cleaned
 
 
 class HikvisionDeviceRead(HikvisionDeviceBase):
@@ -83,8 +135,10 @@ class HikvisionDeviceRead(HikvisionDeviceBase):
 
 
 class ISAPITestConnectionRequest(BaseModel):
+    connection_mode: Literal["isapi", "isup"] = Field(default="isapi")
+    isup_device_id: Optional[str] = Field(default=None, max_length=256)
     protocol: Literal["http", "https"] = "http"
-    ip_address: str = Field(..., min_length=3, max_length=120)
+    ip_address: Optional[str] = Field(default=None, max_length=120)
     port: int = Field(default=80, ge=1, le=65535)
     username: str = Field(default="admin", min_length=1, max_length=64)
     password: Optional[str] = Field(default=None, max_length=128)
@@ -418,3 +472,60 @@ class ISAPIOfflineSyncResponse(BaseModel):
     skipped_duplicates_count: int = 0
     recalculated_days_count: int = 0
     message: str
+
+
+class ISUPSidecarHealthResponse(BaseModel):
+    configured: bool
+    reachable: bool
+    status: str
+    sidecar_url: Optional[str] = None
+    isup_initialized: bool = False
+    isup_listening: bool = False
+    listen_endpoint: Optional[str] = None
+    sdk_build_version: Optional[str] = None
+    online_devices: int = 0
+    total_known_devices: int = 0
+    started_at_utc: Optional[str] = None
+    message: str
+
+
+class ISUPConnectedDeviceItem(BaseModel):
+    isup_device_id: str
+    is_online: bool
+    ip_address: Optional[str] = None
+    port: Optional[int] = None
+    device_name: Optional[str] = None
+    serial_number: Optional[str] = None
+    full_serial_number: Optional[str] = None
+    firmware_version: Optional[str] = None
+    protocol_version: Optional[str] = None
+    connected_at_utc: Optional[str] = None
+    last_seen_utc: Optional[str] = None
+    disconnected_at_utc: Optional[str] = None
+    linked_device_id: Optional[int] = None
+    linked_device_name: Optional[str] = None
+    linked_company_id: Optional[int] = None
+    linked_company_name: Optional[str] = None
+
+
+class ISUPConnectedDevicesResponse(BaseModel):
+    count: int = 0
+    online_count: int = 0
+    devices: list[ISUPConnectedDeviceItem] = Field(default_factory=list)
+
+
+class ISUPStatusSyncResponse(BaseModel):
+    total_isup_devices: int = 0
+    online_updated: int = 0
+    offline_updated: int = 0
+    unlinked_sidecar_devices: list[str] = Field(default_factory=list)
+    message: str
+
+
+class ISUPProvisioningInfoResponse(BaseModel):
+    protocol: str = "ISUP 5.0"
+    server_host: str
+    server_port: int = 7660
+    encryption_key: str
+    isup_enabled: bool = True
+    suggested_device_id: Optional[str] = None
