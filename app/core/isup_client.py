@@ -9,13 +9,20 @@ sin VPN ni IP pública en los biométricos.
 from __future__ import annotations
 
 import base64
+import json
 from typing import Any, Optional
 from urllib.parse import urlencode, urlparse
 
 import httpx
 
 from app.core.config import settings
-from app.core.isapi import HikvisionISAPIClient, ISAPIError
+from app.core.isapi import (
+    HikvisionISAPIClient,
+    ISAPIError,
+    ImageNotSuport,
+    SubpicAnalysisModelingError,
+)
+from app.core.isup_face_staging import stage_isup_face_image
 
 
 class IsupSidecarClient:
@@ -414,7 +421,19 @@ class HikvisionISUPClient(HikvisionISAPIClient):
         if isapi_status_code is not None and int(isapi_status_code) != 1:
             sub = res.get("isapiSubStatusCode") or ""
             status_str = res.get("isapiStatusString") or "ISAPI Error"
+            error_msg = res.get("isapiErrorMsg") or ""
+            if not error_msg:
+                raw_text_err = str(res.get("rawResponse") or "").lstrip()
+                if raw_text_err.startswith("{"):
+                    try:
+                        parsed_err = json.loads(raw_text_err)
+                        if isinstance(parsed_err, dict) and parsed_err.get("errorMsg"):
+                            error_msg = str(parsed_err["errorMsg"]).strip()
+                    except Exception:
+                        pass
             detail = f"{status_str} ({sub})".strip() if sub else str(status_str)
+            if error_msg:
+                detail = f"{detail}: {error_msg}"
             raise ISAPIError(
                 f"Respuesta de error ISAPI vía ISUP ({detail})",
                 status_code=400,
@@ -427,6 +446,90 @@ class HikvisionISUPClient(HikvisionISAPIClient):
             content=content_bytes,
             request=dummy_request,
         )
+
+    def save_face_image(self, base64_img: str, employee_no: str) -> dict[str, Any]:
+        """Registra un rostro JPEG en modo ISUP 5.0 enviando JSON puro con `faceURL` a FDSetUp.
+
+        En ISUP 5.0, NET_ECMS_ISAPIPassThrough no transmite cabeceras HTTP (`Content-Type: multipart/form-data`),
+        por lo que el biométrico rechaza payloads multipart con `MessageParametersLack`.
+        En su lugar, se publica temporalmente el JPEG en una URL corta y se envía JSON con `faceURL`
+        para que el reloj descargue la fotografía directamente vía HTTP y modele el rostro.
+        """
+        raw_str = (base64_img or "").strip()
+        if not raw_str:
+            raise ImageNotSuport("No se proporcionó ninguna imagen en base64")
+
+        if "," in raw_str and raw_str.startswith("data:"):
+            header, b64_data = raw_str.split(",", 1)
+            if "image/jpeg" not in header.lower() and "image/jpg" not in header.lower():
+                raise ImageNotSuport(
+                    "Formato de imagen no soportado. El dispositivo Hikvision requiere imagen JPEG (data:image/jpeg;base64,...)."
+                )
+        else:
+            b64_data = raw_str
+
+        try:
+            image_bytes = base64.b64decode(b64_data, validate=False)
+        except Exception as exc:
+            raise ImageNotSuport("La cadena base64 de la imagen facial es inválida") from exc
+
+        if len(image_bytes) < 4 or not image_bytes.startswith(b"\xff\xd8\xff"):
+            raise ImageNotSuport(
+                "El archivo decodificado no es un JPEG válido. Usa una fotografía en formato JPG/JPEG."
+            )
+
+        clean_emp_no = str(employee_no).strip()
+        _, face_url = stage_isup_face_image(image_bytes)
+
+        payload = {
+            "faceLibType": "blackFD",
+            "FDID": "1",
+            "FPID": clean_emp_no,
+            "faceURL": face_url,
+        }
+
+        try:
+            resp = self._request(
+                "PUT",
+                "/ISAPI/Intelligent/FDLib/FDSetUp",
+                params={"format": "json"},
+                json_body=payload,
+                timeout_override=20.0,
+            )
+        except ISAPIError as exc:
+            lower_msg = exc.message.lower()
+            if "modeling" in lower_msg or "subpic" in lower_msg:
+                raise SubpicAnalysisModelingError(
+                    f"El reloj rechazó la fotografía porque no pudo modelar el rostro: {exc.message}",
+                    exc.status_code,
+                ) from exc
+            if any(k in lower_msg for k in ("faceurl", "download", "connect", "url", "timeout")):
+                raise ISAPIError(
+                    f"{exc.message} (El reloj intentó descargar la foto desde {face_url}. "
+                    "Verifica que el biométrico tenga acceso HTTP a esa URL/puerto o configura ISUP_FACE_PUBLIC_BASE_URL).",
+                    exc.status_code,
+                ) from exc
+            raise
+
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                sub_code = str(body.get("subStatusCode") or "")
+                if body.get("statusCode", 1) != 1 and sub_code not in ("", "ok"):
+                    raise SubpicAnalysisModelingError(
+                        f"El dispositivo no pudo modelar el rostro ({sub_code}): {body.get('errorMsg') or body.get('statusString')}"
+                    )
+        except SubpicAnalysisModelingError:
+            raise
+        except Exception:
+            pass
+
+        return {
+            "employee_no": clean_emp_no,
+            "status": "OK",
+            "face_url": face_url,
+            "message": f"Rostro JPEG registrado correctamente vía ISUP (faceURL) para el empleado {clean_emp_no}",
+        }
 
     def _get_image_file_safe(self, file_url: str) -> bytes:
         """En modo ISUP, extrae solo path+query de la URL interna del equipo y la solicita vía passthrough."""

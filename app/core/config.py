@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     ISUP_ENCRYPTION_KEY: str = ""
     ISUP_SERVER_HOST: Optional[str] = None
     ISUP_SERVER_PORT: int = 7660
+    ISUP_FACE_PUBLIC_BASE_URL: Optional[str] = None
+    ISUP_FACE_URL_TTL_SECONDS: int = 120
 
     ALLOWED_HOSTS: list[str] = [
         "*",
@@ -103,6 +105,24 @@ class Settings(BaseSettings):
         if self.MEDIA_PUBLIC_BASE_URL and self.MEDIA_PUBLIC_BASE_URL.strip():
             return self.MEDIA_PUBLIC_BASE_URL.strip().rstrip("/")
         return f"http://{self.APP_HOST}:{self.APP_PORT}{self.API_V1_STR}"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def isup_face_base_url(self) -> str:
+        """URL base HTTP/HTTPS alcanzable por los biométricos ISUP para descargar faceURL."""
+        for raw_base in (self.ISUP_FACE_PUBLIC_BASE_URL, self.MEDIA_PUBLIC_BASE_URL):
+            if raw_base and raw_base.strip():
+                base = raw_base.strip().rstrip("/")
+                if not base.endswith(self.API_V1_STR):
+                    base = f"{base}{self.API_V1_STR}"
+                return base
+        if self.ISUP_SERVER_HOST and self.ISUP_SERVER_HOST.strip():
+            host = self.ISUP_SERVER_HOST.strip()
+            if host.startswith(("http://", "https://")):
+                base = host.rstrip("/")
+                return base if base.endswith(self.API_V1_STR) else f"{base}{self.API_V1_STR}"
+            return f"http://{host}:{self.APP_PORT}{self.API_V1_STR}"
+        return self.public_api_base_url
 
     @computed_field  # type: ignore[prop-decorator]
     @property

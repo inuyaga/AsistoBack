@@ -4,7 +4,7 @@ import re
 import secrets
 from typing import Any, Callable, Literal, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import func, or_, select
 
 from app.api.deps import CurrentUser, SessionDep, require_permissions
@@ -22,6 +22,7 @@ from app.core.isapi import (
     IsapiGenerateXmlController,
 )
 from app.core.isup_client import HikvisionISUPClient, IsupSidecarClient
+from app.core.isup_face_staging import read_staged_isup_face_image
 from app.core.security import decrypt_secret, encrypt_secret
 from app.models.attendance import AttendanceLog
 from app.models.collaborator import Collaborator, CollaboratorDeviceSync, Company
@@ -1617,6 +1618,37 @@ def test_raw_isapi_connection(
             status="offline" if exc.status_code in (502, 504) else "error",
             message=exc.message,
         )
+
+
+@router.api_route(
+    "/isup-face/{token}.jpg",
+    methods=["GET", "HEAD"],
+    include_in_schema=False,
+    summary="Servir temporalmente fotografía facial JPEG para descarga por biométricos Hikvision vía ISUP (faceURL)",
+)
+def download_staged_isup_face(token: str, request: Request) -> Response:
+    jpeg_bytes = read_staged_isup_face_image(token)
+    if jpeg_bytes is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Imagen facial temporal no encontrada o expirada.",
+        )
+
+    headers = {
+        "Content-Length": str(len(jpeg_bytes)),
+        "Cache-Control": "no-store, max-age=0",
+    }
+    if request.method == "HEAD":
+        return Response(
+            status_code=status.HTTP_200_OK,
+            media_type="image/jpeg",
+            headers=headers,
+        )
+    return Response(
+        content=jpeg_bytes,
+        media_type="image/jpeg",
+        headers=headers,
+    )
 
 
 @router.get(
